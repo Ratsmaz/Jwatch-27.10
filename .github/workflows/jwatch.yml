@@ -1,0 +1,169 @@
+name: Jwatch Daily
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # 06:00 Europe/Zurich = 05:00 UTC
+  workflow_dispatch: {}    # manueller Start möglich
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4 lxml python-dateutil
+
+      - name: Run crawler (ULTRA-SIMPLE)
+        run: |
+          python - <<'PY'
+          import csv, time, re, sys
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          CSV_PATH = "data/bookmarks.csv"
+          ATS = re.compile(r"(myworkdayjobs\.com|successfactors\.com|greenhouse\.io|lever\.co|smartrecruiters\.com|taleo\.net)$", re.I)
+          UA = "jwatch-actions/1.0 (+github)"
+          session = requests.Session(); session.headers["User-Agent"] = UA
+
+          # 1) CSV lesen
+          try:
+            with open(CSV_PATH, newline='', encoding='utf-8') as f:
+              rows = list(csv.DictReader(f))
+          except Exception as e:
+            body = f"CSV nicht lesbar: {e}"
+            print(body); open("digest.txt","w",encoding="utf-8").write(body); sys.exit(0)
+
+          expected = ["url","scope_hint","include_keywords","exclude_keywords","depth","lang","login_required","notes"]
+          if [c.strip() for c in rows[0].keys()] != expected:
+            body = "Header mismatch: " + ", ".join(rows[0].keys())
+            print(body); open("digest.txt","w",encoding="utf-8").write(body); sys.exit(0)
+
+          def fetch(u, tries=3, timeout=25):
+            for _ in range(tries):
+              try:
+                r = session.get(u, timeout=timeout, allow_redirects=True)
+                if r.status_code == 200:
+                  return r.text
+              except Exception:
+                pass
+              time.sleep(2)
+            return None
+
+          def extract_jobs(html, base, scope_hint):
+            soup = BeautifulSoup(html, "lxml")
+            root = soup
+            if scope_hint:
+              # CSS-Selector versuchen
+              try:
+                sel = soup.select(scope_hint)
+                if sel:
+                  root = BeautifulSoup("".join(str(s) for s in sel), "lxml")
+              except Exception:
+                # weicher Textanker-Fallback (ignorieren, wenn nicht gefunden)
+                pass
+            jobs=[]
+            for a in root.find_all("a", href=True):
+              txt = " ".join(a.get_text(" ", strip=True).split())
+              if not txt: continue
+              if re.search(r"(job|jobs|career|vacanc|stelle|emploi|recruit)", a["href"] + " " + txt, re.I):
+                link = urljoin(base, a["href"])
+                jobs.append((txt, link))
+            # entdoppeln
+            seen=set(); out=[]
+            for t,l in jobs:
+              k=(t.lower(), l)
+              if k in seen: continue
+              seen.add(k); out.append((t,l))
+            return out
+
+          digest = {}
+          for r in rows:
+            if (r.get("login_required","").strip().lower() == "yes"):
+              continue
+            url = (r.get("url") or "").strip()
+            if not url.startswith("http"):
+              continue
+
+            html = fetch(url)
+            if not html:
+              continue
+
+            scope = (r.get("scope_hint") or "").strip() or None
+            entries = extract_jobs(html, url, scope)
+
+            depth = (r.get("depth") or "").strip().lower()
+            auto = (depth in ("", "auto"))
+            do_d1 = (depth == "1") or auto
+
+            out=[]
+            for title, link in entries:
+              out.append((title, link))
+              if do_d1:
+                try:
+                  host = urlparse(link).netloc.lower()
+                  if ATS.search(host):
+                    _ = fetch(link)  # genau 1 ATS-Hop, keine extra-Parse
+                except Exception:
+                  pass
+
+            dom = urlparse(url).netloc
+            if out:
+              digest.setdefault(dom, []).extend(out)
+
+          lines=[]
+          for dom, items in sorted(digest.items()):
+            lines.append(f"== {dom} ==")
+            for t, l in items:
+              lines.append(f"- {t} —  —  —  —  — {l}")  # ULTRA-SIMPLE: nur Titel + Link
+            lines.append("")
+          body = "\n".join(lines) if lines else "Keine neuen Ausschreibungen gefunden."
+
+          with open("digest.txt","w",encoding="utf-8") as f:
+            f.write(body)
+          print(body)
+          # Job Summary
+          import os
+          summ = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summ:
+            with open(summ,"a",encoding="utf-8") as s:
+              s.write("### Jwatch Digest\n\n```\n"+body+"\n```\n")
+          PY
+
+      - name: Upload digest as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jwatch-digest
+          path: digest.txt
+
+      # OPTIONAL: E-Mail versenden (nur wenn du unten Secrets/Variablen setzt)
+      - name: Send mail (optional)
+        if: ${{ secrets.SMTP_USER != '' && secrets.SMTP_PASS != '' && vars.SMTP_HOST != '' && vars.MAIL_TO != '' && vars.MAIL_FROM != '' }}
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          MAIL_TO:    ${{ vars.MAIL_TO }}
+          MAIL_FROM:  ${{ vars.MAIL_FROM }}
+        run: |
+          python - <<'PY'
+          import os, smtplib
+          from email.mime.text import MIMEText
+          with open("digest.txt","r",encoding="utf-8") as f:
+            body=f.read()
+          msg=MIMEText(body,"plain","utf-8")
+          msg["Subject"]="Jwatch Digest"
+          msg["From"]=os.environ["MAIL_FROM"]
+          msg["To"]=os.environ["MAIL_TO"]
+          with smtplib.SMTP(os.environ["SMTP_HOST"],587,timeout=20) as s:
+            s.starttls()
+            s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+            s.send_message(msg)
+          print("Mail sent.")
+          PY
